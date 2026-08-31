@@ -1,0 +1,390 @@
+"""
+架構: 28x28x1 -> 6x24x24 -> 6x12x12 -> 12x8x8 -> 12x4x4 -> 192 -> 10
+
+Conv1 -> ReLU -> MaxPool -> Conv2 -> ReLU -> MaxPool -> Flatten -> FC -> Softmax+CrossEntropy
+"""
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# 工具函式：im2col / col2im
+# 把 conv 的 sliding window 轉成矩陣乘法，這樣不用寫三層 for loop
+# ---------------------------------------------------------------------------
+def get_im2col_indices(x_shape, field_h, field_w, stride=1):
+    N, C, H, W = x_shape
+    out_h = (H - field_h) // stride + 1
+    out_w = (W - field_w) // stride + 1
+
+    i0 = np.repeat(np.arange(field_h), field_w)
+    i0 = np.tile(i0, C)
+    i1 = stride * np.repeat(np.arange(out_h), out_w)
+    j0 = np.tile(np.arange(field_w), field_h * C)
+    j1 = stride * np.tile(np.arange(out_w), out_h)
+    i = i0.reshape(-1, 1) + i1.reshape(1, -1)
+    j = j0.reshape(-1, 1) + j1.reshape(1, -1)
+
+    k = np.repeat(np.arange(C), field_h * field_w).reshape(-1, 1)
+    return k, i, j
+
+
+def im2col(x, field_h, field_w, stride=1):
+    """[N,C,H,W] -> [C*field_h*field_w, N*out_h*out_w]"""
+    N, C, H, W = x.shape
+    k, i, j = get_im2col_indices(x.shape, field_h, field_w, stride)
+    cols = x[:, k, i, j]  # [N, C*fh*fw, out_h*out_w]
+    cols = cols.transpose(1, 2, 0).reshape(C * field_h * field_w, -1)
+    return cols
+
+
+def col2im(cols, x_shape, field_h, field_w, stride=1):
+    """cols -> [N,C,H,W]，用於 backward 把 gradient 疊加回原本 patch 的位置"""
+    N, C, H, W = x_shape
+    out_h = (H - field_h) // stride + 1
+    out_w = (W - field_w) // stride + 1
+    k, i, j = get_im2col_indices(x_shape, field_h, field_w, stride)
+
+    cols_reshaped = cols.reshape(C * field_h * field_w, out_h * out_w, N).transpose(2, 0, 1)
+    x = np.zeros((N, C, H, W), dtype=cols.dtype)
+    np.add.at(x, (slice(None), k, i, j), cols_reshaped)
+    return x
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: Conv2D
+# ---------------------------------------------------------------------------
+class Conv2D:
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1):
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.k = kernel_size
+        self.stride = stride
+
+        # He initialization
+        scale = np.sqrt(2.0 / (in_channels * kernel_size * kernel_size))
+        self.W = np.random.randn(out_channels, in_channels, kernel_size, kernel_size) * scale
+        self.b = np.zeros(out_channels)
+
+        self.dW = None
+        self.db = None
+        self._cache = None
+
+    def forward(self, x):
+        # x: [N, C, H, W]
+        N, C, H, W = x.shape
+        out_h = (H - self.k) // self.stride + 1
+        out_w = (W - self.k) // self.stride + 1
+
+        x_cols = im2col(x, self.k, self.k, self.stride)          # [C*k*k, N*out_h*out_w]
+        W_row = self.W.reshape(self.out_channels, -1)            # [out_c, C*k*k]
+
+        out = W_row @ x_cols + self.b.reshape(-1, 1)             # [out_c, N*out_h*out_w]
+        out = out.reshape(self.out_channels, out_h, out_w, N).transpose(3, 0, 1, 2)  # [N,out_c,out_h,out_w]
+
+        self._cache = (x, x_cols)
+        return out
+
+    def backward(self, dout):
+        x, x_cols = self._cache
+        N, C, H, W = x.shape
+
+        # dout: [N, out_c, out_h, out_w] -> [out_c, N*out_h*out_w]
+        dout_reshaped = dout.transpose(1, 2, 3, 0).reshape(self.out_channels, -1)
+
+        self.db = dout_reshaped.sum(axis=1)
+        self.dW = (dout_reshaped @ x_cols.T).reshape(self.W.shape)
+
+        W_row = self.W.reshape(self.out_channels, -1)
+        dx_cols = W_row.T @ dout_reshaped                        # [C*k*k, N*out_h*out_w]
+        dx = col2im(dx_cols, x.shape, self.k, self.k, self.stride)
+        return dx
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: ReLU
+# ---------------------------------------------------------------------------
+class ReLU:
+    def __init__(self):
+        self._mask = None
+
+    def forward(self, x):
+        self._mask = x > 0
+        return x * self._mask
+
+    def backward(self, dout):
+        return dout * self._mask
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: MaxPool2D
+# ---------------------------------------------------------------------------
+class MaxPool2D:
+    def __init__(self, size=2, stride=2):
+        self.size = size
+        self.stride = stride
+        self._cache = None
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+        s, st = self.size, self.stride
+        out_h = (H - s) // st + 1
+        out_w = (W - s) // st + 1
+
+        out = np.zeros((N, C, out_h, out_w))
+        # 記住每個 pooling window 裡最大值的位置，backward 才知道 gradient 要傳去哪
+        argmax = np.zeros((N, C, out_h, out_w, 2), dtype=int)
+
+        for i in range(out_h):
+            for j in range(out_w):
+                h_start, w_start = i * st, j * st
+                window = x[:, :, h_start:h_start + s, w_start:w_start + s]  # [N,C,s,s]
+                window_flat = window.reshape(N, C, -1)
+                idx = np.argmax(window_flat, axis=2)
+                out[:, :, i, j] = np.max(window_flat, axis=2)
+                argmax[:, :, i, j, 0] = idx // s
+                argmax[:, :, i, j, 1] = idx % s
+
+        self._cache = (x.shape, argmax)
+        return out
+
+    def backward(self, dout):
+        x_shape, argmax = self._cache
+        N, C, H, W = x_shape
+        s, st = self.size, self.stride
+        out_h, out_w = dout.shape[2], dout.shape[3]
+
+        dx = np.zeros(x_shape)
+        for i in range(out_h):
+            for j in range(out_w):
+                h_start, w_start = i * st, j * st
+                for n in range(N):
+                    for c in range(C):
+                        dh, dw = argmax[n, c, i, j]
+                        dx[n, c, h_start + dh, w_start + dw] += dout[n, c, i, j]
+        return dx
+
+
+# ---------------------------------------------------------------------------
+# Layer 4: Flatten
+# ---------------------------------------------------------------------------
+class Flatten:
+    def __init__(self):
+        self._shape = None
+
+    def forward(self, x):
+        self._shape = x.shape
+        return x.reshape(x.shape[0], -1)  # batch dimension 保留 (Section 16)
+
+    def backward(self, dout):
+        return dout.reshape(self._shape)
+
+
+# ---------------------------------------------------------------------------
+# Layer 5: Fully Connected (Linear)
+# ---------------------------------------------------------------------------
+class Linear:
+    def __init__(self, in_features, out_features):
+        scale = np.sqrt(2.0 / in_features)
+        self.W = np.random.randn(in_features, out_features) * scale
+        self.b = np.zeros(out_features)
+        self.dW = None
+        self.db = None
+        self._x = None
+
+    def forward(self, x):
+        self._x = x
+        return x @ self.W + self.b
+
+    def backward(self, dout):
+        self.dW = self._x.T @ dout
+        self.db = dout.sum(axis=0)
+        dx = dout @ self.W.T
+        return dx
+
+
+# ---------------------------------------------------------------------------
+# Loss: Softmax + CrossEntropy 合併計算 (數值穩定，Section 18)
+# ---------------------------------------------------------------------------
+class SoftmaxCrossEntropy:
+    def __init__(self):
+        self._probs = None
+        self._labels = None
+
+    def forward(self, logits, labels):
+        # logits: [N,10], labels: [N] (int class index)
+        shifted = logits - np.max(logits, axis=1, keepdims=True)
+        exp = np.exp(shifted)
+        probs = exp / np.sum(exp, axis=1, keepdims=True)
+
+        N = logits.shape[0]
+        log_likelihood = -np.log(probs[np.arange(N), labels] + 1e-12)
+        loss = np.mean(log_likelihood)
+
+        self._probs = probs
+        self._labels = labels
+        return loss
+
+    def backward(self):
+        N = self._probs.shape[0]
+        dlogits = self._probs.copy()
+        dlogits[np.arange(N), self._labels] -= 1
+        dlogits /= N
+        return dlogits
+
+
+# ---------------------------------------------------------------------------
+# 整個 CNN：串起所有 layer (對應 Section 19 的 forward 流程圖)
+# ---------------------------------------------------------------------------
+class SimpleCNN:
+    def __init__(self):
+        self.conv1 = Conv2D(in_channels=1, out_channels=6, kernel_size=5)
+        self.relu1 = ReLU()
+        self.pool1 = MaxPool2D(size=2, stride=2)
+
+        self.conv2 = Conv2D(in_channels=6, out_channels=12, kernel_size=5)
+        self.relu2 = ReLU()
+        self.pool2 = MaxPool2D(size=2, stride=2)
+
+        self.flatten = Flatten()
+        self.fc = Linear(12 * 4 * 4, 10)
+
+        self.loss_fn = SoftmaxCrossEntropy()
+
+    def forward(self, x):
+        x = self.conv1.forward(x)      # [N,6,24,24]
+        x = self.relu1.forward(x)
+        x = self.pool1.forward(x)      # [N,6,12,12]
+
+        x = self.conv2.forward(x)      # [N,12,8,8]
+        x = self.relu2.forward(x)
+        x = self.pool2.forward(x)      # [N,12,4,4]
+
+        x = self.flatten.forward(x)    # [N,192]
+        logits = self.fc.forward(x)    # [N,10]
+        return logits
+
+    def compute_loss(self, logits, labels):
+        return self.loss_fn.forward(logits, labels)
+
+    def backward(self):
+        # 完全手動反向傳播 (Section 20-22)，順序和 forward 相反
+        dlogits = self.loss_fn.backward()          # [N,10]
+        dx = self.fc.backward(dlogits)              # [N,192]
+        dx = self.flatten.backward(dx)               # [N,12,4,4]
+
+        dx = self.pool2.backward(dx)                 # [N,12,8,8]
+        dx = self.relu2.backward(dx)
+        dx = self.conv2.backward(dx)                  # [N,6,12,12]
+
+        dx = self.pool1.backward(dx)                  # [N,6,24,24]
+        dx = self.relu1.backward(dx)
+        dx = self.conv1.backward(dx)                   # [N,1,28,28]
+        return dx
+
+    def parameters_and_grads(self):
+        """回傳所有需要更新的 (parameter, gradient) pair，給 optimizer 用"""
+        return [
+            (self.conv1.W, self.conv1.dW), (self.conv1.b, self.conv1.db),
+            (self.conv2.W, self.conv2.dW), (self.conv2.b, self.conv2.db),
+            (self.fc.W, self.fc.dW), (self.fc.b, self.fc.db),
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Optimizer: 
+#     W_new = W_old - lr * dW
+# ---------------------------------------------------------------------------
+def sgd_step(model, lr=0.01):
+    model.conv1.W -= lr * model.conv1.dW
+    model.conv1.b -= lr * model.conv1.db
+    model.conv2.W -= lr * model.conv2.dW
+    model.conv2.b -= lr * model.conv2.db
+    model.fc.W -= lr * model.fc.dW
+    model.fc.b -= lr * model.fc.db
+
+
+# ---------------------------------------------------------------------------
+# 資料載入：MNIST 
+# ---------------------------------------------------------------------------
+def load_mnist(n_train=2000, n_test=200):
+    try:
+        from sklearn.datasets import fetch_openml
+        mnist = fetch_openml("mnist_784", version=1, as_frame=False)
+        X = mnist.data.astype(np.float32) / 255.0
+        y = mnist.target.astype(np.int64)
+
+        X = X.reshape(-1, 1, 28, 28)
+        X_train, y_train = X[:n_train], y[:n_train]
+        X_test, y_test = X[60000:60000 + n_test], y[60000:60000 + n_test]
+        return X_train, y_train, X_test, y_test
+
+    except Exception as e:
+        print(f"[警告] 無法下載 MNIST ({e})，改用隨機假資料以便先測試程式流程")
+        rng = np.random.default_rng(0)
+        X_train = rng.standard_normal((n_train, 1, 28, 28)).astype(np.float32)
+        y_train = rng.integers(0, 10, size=n_train)
+        X_test = rng.standard_normal((n_test, 1, 28, 28)).astype(np.float32)
+        y_test = rng.integers(0, 10, size=n_test)
+        return X_train, y_train, X_test, y_test
+
+
+def iterate_minibatches(X, y, batch_size, shuffle=True):
+    N = X.shape[0]
+    indices = np.arange(N)
+    if shuffle:
+        np.random.shuffle(indices)
+    for start in range(0, N, batch_size):
+        batch_idx = indices[start:start + batch_size]
+        yield X[batch_idx], y[batch_idx]
+
+
+def accuracy(logits, labels):
+    preds = np.argmax(logits, axis=1)
+    return np.mean(preds == labels)
+
+
+# ---------------------------------------------------------------------------
+# Main: 完整 training loop 
+# ---------------------------------------------------------------------------
+def main():
+    np.random.seed(42)
+
+    batch_size = 32
+    num_epochs = 5
+    lr = 0.05
+
+    print("載入 MNIST 資料...")
+    X_train, y_train, X_test, y_test = load_mnist(n_train=2000, n_test=200)
+    print(f"train: {X_train.shape}, test: {X_test.shape}")
+
+    model = SimpleCNN()
+
+    for epoch in range(1, num_epochs + 1):
+        total_loss, total_correct, total_count = 0.0, 0, 0
+
+        for X_batch, y_batch in iterate_minibatches(X_train, y_train, batch_size):
+            # Forward
+            logits = model.forward(X_batch)
+            loss = model.compute_loss(logits, y_batch)
+
+            model.backward()
+
+            sgd_step(model, lr=lr)
+
+            total_loss += loss * X_batch.shape[0]
+            total_correct += np.sum(np.argmax(logits, axis=1) == y_batch)
+            total_count += X_batch.shape[0]
+
+        train_loss = total_loss / total_count
+        train_acc = total_correct / total_count
+
+        # 簡單在 test set 上算一次 forward 看 accuracy (不需要 backward)
+        test_logits = model.forward(X_test)
+        test_acc = accuracy(test_logits, y_test)
+
+        print(f"Epoch {epoch}/{num_epochs} | train_loss={train_loss:.4f} "
+              f"train_acc={train_acc:.4f} | test_acc={test_acc:.4f}")
+
+
+if __name__ == "__main__":
+    main()
