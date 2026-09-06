@@ -1,16 +1,116 @@
+# HW03 CNN
+## 目標
+1. 利用Numpy實作卷積網路 (Convolution, ReLU, Pooling, Flatten, Linear)
+1. 撰寫 Loss function 與 Optimizer (CrossEntropy + Adam)
+1. 建立訓練流程與批次更新
+1. 評估模型表現與測試集準確率
+
+## 前置作業
+### 套件
+- `sklearn.datasets.fetch_openml`：下載 MNIST 資料
+- `numpy` : 數值計算，整個模型（包含 forward、backward、Adam）完全不依賴任何深度學習框架的 autograd
+- `time` : 訓練時間統計
+- `matplotlib` : 畫 loss 曲線、confusion matrix、預測錯誤的圖片
+
+## 資料處理
+### MNIST 資料集
+透過 - `sklearn.datasets.fetch_openml("mnist_784")`  取得 28×28 灰階手寫數字影像
+* 類別：數字`0–9` 共 10 類
+### 前處理
+* 正規化：像素值除以 255，縮放至 [0,1]
+* 增加通道維度：`(N, 28, 28)` → `(N, 1, 28, 28)`
+* 先打亂再切分：MNIST 原始資料是照數字排序的，若不打亂直接切割，各個 split 的類別分布會嚴重不均
+### 資料切分比例：train : test : valid = 7 : 2 : 1
+* train：拿去算 gradient、更新權重
+* valid：訓練過程中每個 epoch 拿來監控，不參與訓練，用來觀察有沒有 overfitting
+* test：完全不看，直到訓練全部結束後才評估一次，代表模型對真正沒看過資料的表現
+
+```python
+n_train = int(N * 0.7)
+n_test  = int(N * 0.2)
+X_train, y_train = X[:n_train], y[:n_train]
+X_test,  y_test  = X[n_train:n_train+n_test], y[n_train:n_train+n_test]
+X_valid, y_valid = X[n_train+n_test:], y[n_train+n_test:]   # 剩下的都給 valid
+```
+## 建立CNN模型
+### 模型結構
+* Conv2D(1→6, k=5, valid padding**不填充，使用原始影像數據**) → ReLU → MaxPool(2×2)
+* Conv2D(6→12, k=5, valid padding) → ReLU → MaxPool(2×2)
+* Flatten (12×4×4 = 192)
+* Linear(192 → 10)
+### 自行實作模組
+* Conv2D：用 im2col / col2im 把 sliding window 轉成矩陣乘法，而不是三層 for-loop 的 naive 卷積
+* ReLU：forward 記住 mask，backward 只把 gradient 傳給正值的位置
+* MaxPool2D：forward 時記住每個 2×2 window 最大值的座標，backward 時 gradient 只傳回該座標
+* Flatten：保留 batch dimension，只攤平 channel/height/width
+* Linear：標準矩陣乘法全連接層
+### 自行撰寫副程式
+* Loss function：SoftmaxCrossEntropy，把 Softmax 和 CrossEntropy 合併計算（數值上先減去 max 再取 exp，避免溢位），backward() 直接是 probs - one_hot，是整條反向傳播鏈最簡潔的起點
+* Optimizer：AdamOptimizer，對每個參數各自維護一階動量 m（類似慣性）和二階動量 v（類似自適應學習率），並做 bias correction
+```python
+self.m[i] = beta1 * self.m[i] + (1 - beta1) * g
+self.v[i] = beta2 * self.v[i] + (1 - beta2) * (g ** 2)
+m_hat = self.m[i] / (1 - beta1 ** t)
+v_hat = self.v[i] / (1 - beta2 ** t)
+p -= lr * m_hat / (np.sqrt(v_hat) + eps)
+```
+
+## 訓練流程
+### 4.1 超參數
+* Epochs = 3
+* Batch size = 32
+* Learning rate = 0.001(1e-3)
+* Optimizer = Adam (β1=0.9, β2=0.999, eps=1e-8)
+### 4.2 流程
+1. 前向傳播：`Conv1 → ReLU → Pool → Conv2 → ReLU → Pool → Flatten → Linear` 算出 logits
+1. Loss & Gradient：`SoftmaxCrossEntropy.forward()` 算 `loss，backward()` 算出對 logits 的梯度
+1. 反向傳播：從 `Linear` 一路反推回 `Conv1`，順序與 forward 完全相反
+1. 參數更新：呼叫 `AdamOptimizer.step()` 更新所有 Conv/Linear 的權重
+1. 驗證評估：每個 epoch 用 validation set 計算 accuracy（監控用，不影響訓練）
+1. 時間統計：用` time.time()` 記錄每個 epoch 花費時間，以及總訓練時間
+```python
+train_start = time.time()
+for epoch in range(1, num_epochs + 1):
+    epoch_start = time.time()
+    for X_batch, y_batch in iterate_minibatches(X_train, y_train, batch_size):
+        logits = model.forward(X_batch)
+        loss = model.compute_loss(logits, y_batch)
+        model.backward()
+        optimizer.step(model.parameters_and_grads())
+    epoch_time = time.time() - epoch_start
+    ...
+total_train_time = time.time() - train_start
+```
+
+---
+
+## 結果
+![image](https://hackmd.io/_uploads/SyX2KYq_Ge.png)
+![image](https://hackmd.io/_uploads/ryunKF9ufg.png)
+![image](https://hackmd.io/_uploads/HyA3Ft9dMg.png)
+![image](https://hackmd.io/_uploads/HJL15t9_ze.png)
+
+## 結論
+* CNN在MNIST手寫辨識上表現良好，得益於卷積層能有效擷取局部空間特徵、MaxPooling縮小尺寸並增加平移不變性
+* 用**im2col**取代naive三層迴圈卷積，能大幅降低純NumPy版本的訓練時間
+* Confusion Matrix比單純的accuracy更能診斷模型弱點，例如特定數字之間（如 4 與 9、2 與 7）的系統性混淆
+* 若要更高準確率，可增加訓練epoch、加深網路、或加入正則化（Dropout、L2）
+
+## 程式碼
+```python=
 """
+CNN From Scratch
 架構: 28x28x1 -> 6x24x24 -> 6x12x12 -> 12x8x8 -> 12x4x4 -> 192 -> 10
 
 Conv1 -> ReLU -> MaxPool -> Conv2 -> ReLU -> MaxPool -> Flatten -> FC -> Softmax+CrossEntropy
+
 """
 
+import time
 import numpy as np
+import matplotlib.pyplot as plt
 
-
-# ---------------------------------------------------------------------------
 # 工具函式：im2col / col2im
-# 把 conv 的 sliding window 轉成矩陣乘法，這樣不用寫三層 for loop
-# ---------------------------------------------------------------------------
 def get_im2col_indices(x_shape, field_h, field_w, stride=1):
     N, C, H, W = x_shape
     out_h = (H - field_h) // stride + 1
@@ -49,10 +149,7 @@ def col2im(cols, x_shape, field_h, field_w, stride=1):
     np.add.at(x, (slice(None), k, i, j), cols_reshaped)
     return x
 
-
-# ---------------------------------------------------------------------------
 # Layer 1: Conv2D
-# ---------------------------------------------------------------------------
 class Conv2D:
     def __init__(self, in_channels, out_channels, kernel_size, stride=1):
         self.in_channels = in_channels
@@ -99,10 +196,7 @@ class Conv2D:
         dx = col2im(dx_cols, x.shape, self.k, self.k, self.stride)
         return dx
 
-
-# ---------------------------------------------------------------------------
 # Layer 2: ReLU
-# ---------------------------------------------------------------------------
 class ReLU:
     def __init__(self):
         self._mask = None
@@ -114,10 +208,7 @@ class ReLU:
     def backward(self, dout):
         return dout * self._mask
 
-
-# ---------------------------------------------------------------------------
 # Layer 3: MaxPool2D
-# ---------------------------------------------------------------------------
 class MaxPool2D:
     def __init__(self, size=2, stride=2):
         self.size = size
@@ -163,10 +254,7 @@ class MaxPool2D:
                         dx[n, c, h_start + dh, w_start + dw] += dout[n, c, i, j]
         return dx
 
-
-# ---------------------------------------------------------------------------
 # Layer 4: Flatten
-# ---------------------------------------------------------------------------
 class Flatten:
     def __init__(self):
         self._shape = None
@@ -178,10 +266,7 @@ class Flatten:
     def backward(self, dout):
         return dout.reshape(self._shape)
 
-
-# ---------------------------------------------------------------------------
 # Layer 5: Fully Connected (Linear)
-# ---------------------------------------------------------------------------
 class Linear:
     def __init__(self, in_features, out_features):
         scale = np.sqrt(2.0 / in_features)
@@ -201,40 +286,7 @@ class Linear:
         dx = dout @ self.W.T
         return dx
 
-
-# ---------------------------------------------------------------------------
-# Loss: Softmax + CrossEntropy 合併計算 (數值穩定，Section 18)
-# ---------------------------------------------------------------------------
-class SoftmaxCrossEntropy:
-    def __init__(self):
-        self._probs = None
-        self._labels = None
-
-    def forward(self, logits, labels):
-        # logits: [N,10], labels: [N] (int class index)
-        shifted = logits - np.max(logits, axis=1, keepdims=True)
-        exp = np.exp(shifted)
-        probs = exp / np.sum(exp, axis=1, keepdims=True)
-
-        N = logits.shape[0]
-        log_likelihood = -np.log(probs[np.arange(N), labels] + 1e-12)
-        loss = np.mean(log_likelihood)
-
-        self._probs = probs
-        self._labels = labels
-        return loss
-
-    def backward(self):
-        N = self._probs.shape[0]
-        dlogits = self._probs.copy()
-        dlogits[np.arange(N), self._labels] -= 1
-        dlogits /= N
-        return dlogits
-
-
-# ---------------------------------------------------------------------------
-# 整個 CNN：串起所有 layer (對應 Section 19 的 forward 流程圖)
-# ---------------------------------------------------------------------------
+# 整個 CNN：串起所有 layer 
 class SimpleCNN:
     def __init__(self):
         self.conv1 = Conv2D(in_channels=1, out_channels=6, kernel_size=5)
@@ -267,7 +319,6 @@ class SimpleCNN:
         return self.loss_fn.forward(logits, labels)
 
     def backward(self):
-        # 完全手動反向傳播 (Section 20-22)，順序和 forward 相反
         dlogits = self.loss_fn.backward()          # [N,10]
         dx = self.fc.backward(dlogits)              # [N,192]
         dx = self.flatten.backward(dx)               # [N,12,4,4]
@@ -289,50 +340,39 @@ class SimpleCNN:
             (self.fc.W, self.fc.dW), (self.fc.b, self.fc.db),
         ]
 
+def load_mnist(train_ratio=2000, test_ratio=200, valid_ratio=100, seed=42):
+    #回傳的 X 形狀是 [N,1,28,28]
+    assert abs(train_ratio + test_ratio + valid_ratio - 1.0) < 1e-6, \
+        "train_ratio + test_ratio + valid_ratio 必須等於 1"
 
-# ---------------------------------------------------------------------------
-# Optimizer: 
-#     W_new = W_old - lr * dW
-# ---------------------------------------------------------------------------
-def sgd_step(model, lr=0.01):
-    model.conv1.W -= lr * model.conv1.dW
-    model.conv1.b -= lr * model.conv1.db
-    model.conv2.W -= lr * model.conv2.dW
-    model.conv2.b -= lr * model.conv2.db
-    model.fc.W -= lr * model.fc.dW
-    model.fc.b -= lr * model.fc.db
+    from sklearn.datasets import fetch_openml
+    mnist = fetch_openml("mnist_784", version=1, as_frame=False)
+    X = mnist.data.astype(np.float32) / 255.0
+    y = mnist.target.astype(np.int64)
+    X = X.reshape(-1, 1, 28, 28)
 
+    # 先打亂再切，避免 MNIST 原本照數字排序導致每個 split 類別分布不均
+    N = X.shape[0]
+    rng = np.random.default_rng(seed)
+    indices = rng.permutation(N)
+    X, y = X[indices], y[indices]
 
-# ---------------------------------------------------------------------------
-# 資料載入：MNIST 
-# ---------------------------------------------------------------------------
-def load_mnist(n_train=2000, n_test=200):
-    try:
-        from sklearn.datasets import fetch_openml
-        mnist = fetch_openml("mnist_784", version=1, as_frame=False)
-        X = mnist.data.astype(np.float32) / 255.0
-        y = mnist.target.astype(np.int64)
+    n_train = int(N * train_ratio)
+    n_test = int(N * test_ratio)
 
-        X = X.reshape(-1, 1, 28, 28)
-        X_train, y_train = X[:n_train], y[:n_train]
-        X_test, y_test = X[60000:60000 + n_test], y[60000:60000 + n_test]
-        return X_train, y_train, X_test, y_test
+    X_train, y_train = X[:n_train], y[:n_train]
+    X_test, y_test = X[n_train:n_train + n_test], y[n_train:n_train + n_test]
+    X_valid, y_valid = X[n_train + n_test:], y[n_train + n_test:]
 
-    except Exception as e:
-        print(f"[警告] 無法下載 MNIST ({e})，改用隨機假資料以便先測試程式流程")
-        rng = np.random.default_rng(0)
-        X_train = rng.standard_normal((n_train, 1, 28, 28)).astype(np.float32)
-        y_train = rng.integers(0, 10, size=n_train)
-        X_test = rng.standard_normal((n_test, 1, 28, 28)).astype(np.float32)
-        y_test = rng.integers(0, 10, size=n_test)
-        return X_train, y_train, X_test, y_test
+    return X_train, y_train, X_test, y_test, X_valid, y_valid
 
 
-def iterate_minibatches(X, y, batch_size, shuffle=True):
+def iterate_minibatches(X, y, batch_size, shuffle=True, seed=None):
     N = X.shape[0]
     indices = np.arange(N)
     if shuffle:
-        np.random.shuffle(indices)
+        rng = np.random.default_rng(seed)
+        rng.shuffle(indices)
     for start in range(0, N, batch_size):
         batch_idx = indices[start:start + batch_size]
         yield X[batch_idx], y[batch_idx]
@@ -342,24 +382,162 @@ def accuracy(logits, labels):
     preds = np.argmax(logits, axis=1)
     return np.mean(preds == labels)
 
+class SoftmaxCrossEntropy:
+    def __init__(self):
+        self._probs = None
+        self._labels = None
 
-# ---------------------------------------------------------------------------
-# Main: 完整 training loop 
-# ---------------------------------------------------------------------------
+    def forward(self, logits, labels):
+        shifted = logits - np.max(logits, axis=1, keepdims=True)
+        exp = np.exp(shifted)
+        probs = exp / np.sum(exp, axis=1, keepdims=True)
+
+        N = logits.shape[0]
+        log_likelihood = -np.log(probs[np.arange(N), labels] + 1e-12)
+        loss = np.mean(log_likelihood)
+
+        self._probs = probs
+        self._labels = labels
+        return loss
+
+    def backward(self):
+        N = self._probs.shape[0]
+        dlogits = self._probs.copy()
+        dlogits[np.arange(N), self._labels] -= 1
+        dlogits /= N
+        return dlogits
+
+class AdamOptimizer:
+    def __init__(self, params, lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8):
+        """
+        params: list of (param_array, grad_array) tuples，例如 model.parameters_and_grads()
+                只在建構時用來決定每個參數的 shape，之後 step() 要重新傳一份最新的 params 進來
+                （因為每次 backward 後 grad_array 都是新的物件）
+        """
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.t = 0
+        self.m = [np.zeros_like(p) for p, g in params]
+        self.v = [np.zeros_like(p) for p, g in params]
+
+    def step(self, params):
+        """params: list of (param_array, grad_array)，跟建構時的順序、shape 必須一致"""
+        self.t += 1
+        for i, (p, g) in enumerate(params):
+            self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * g
+            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * (g ** 2)
+
+            # bias correction：訓練初期 m, v 會偏向 0，這裡做修正
+            m_hat = self.m[i] / (1 - self.beta1 ** self.t)
+            v_hat = self.v[i] / (1 - self.beta2 ** self.t)
+
+            p -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)  # in-place 更新，直接改到原本的權重
+
+# 驗證/觀察工具 3: Confusion Matrix
+def compute_confusion_matrix(y_true, y_pred, num_classes=10):
+    cm = np.zeros((num_classes, num_classes), dtype=int)
+    for t, p in zip(y_true, y_pred):
+        cm[t, p] += 1
+    return cm
+
+
+def plot_confusion_matrix(y_true, y_pred, num_classes=10, title="Confusion Matrix",
+                        save_path="confusion_matrix.png"):
+    cm = compute_confusion_matrix(y_true, y_pred, num_classes)
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_xticks(range(num_classes))
+    ax.set_yticks(range(num_classes))
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("True label")
+    ax.set_title(title)
+
+    threshold = cm.max() / 2 if cm.max() > 0 else 0
+    for i in range(num_classes):
+        for j in range(num_classes):
+            ax.text(j, i, cm[i, j], ha="center", va="center", fontsize=8,
+                    color="white" if cm[i, j] > threshold else "black")
+
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.show()
+    return cm
+
+def plot_loss_curve(batch_losses, epoch_losses, title_prefix=""):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    axes[0].plot(batch_losses, linewidth=0.8)
+    axes[0].set_title(f"{title_prefix} Loss per Batch")
+    axes[0].set_xlabel("Batch (across all epochs)")
+    axes[0].set_ylabel("Loss")
+    axes[0].grid(alpha=0.3)
+
+    axes[1].plot(range(1, len(epoch_losses) + 1), epoch_losses, marker="o")
+    axes[1].set_title(f"{title_prefix} Loss per Epoch (average)")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Loss")
+    axes[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+def show_misclassified(preds, X_images, y_true, num_show=16, save_path="misclassified.png"):
+    wrong_idx = np.where(preds != y_true)[0]
+    print(f"測試集共 {len(y_true)} 筆，預測錯誤 {len(wrong_idx)} 筆 "
+        f"(錯誤率 {len(wrong_idx) / len(y_true):.2%})")
+
+    if len(wrong_idx) == 0:
+        print("沒有預測錯誤的圖片可以顯示。")
+        return
+
+    show_idx = wrong_idx[:num_show]
+    n = len(show_idx)
+    cols = 4
+    rows = int(np.ceil(n / cols))
+
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2, rows * 2.2))
+    axes = np.array(axes).reshape(-1)
+
+    for ax, idx in zip(axes, show_idx):
+        ax.imshow(X_images[idx], cmap="gray")
+        ax.set_title(f"true={y_true[idx]} pred={preds[idx]}", fontsize=9)
+        ax.axis("off")
+
+    for ax in axes[n:]:
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+# Main: 完整 training loop
 def main():
     np.random.seed(42)
 
     batch_size = 32
-    num_epochs = 5
-    lr = 0.05
+    num_epochs = 3
+    lr = 0.001  # Adam 的常見預設學習率比 SGD 小很多，因為它會自動調整每個參數的步伐
 
-    print("載入 MNIST 資料...")
-    X_train, y_train, X_test, y_test = load_mnist(n_train=2000, n_test=200)
-    print(f"train: {X_train.shape}, test: {X_test.shape}")
+    print("載入 MNIST 資料")
+    X_train, y_train, X_test, y_test, X_valid, y_valid = load_mnist(
+        train_ratio=0.7, test_ratio=0.2, valid_ratio=0.1
+    )
+    print(f"train: {X_train.shape}, test: {X_test.shape}, valid: {X_valid.shape}")
 
     model = SimpleCNN()
+    optimizer = AdamOptimizer(model.parameters_and_grads(), lr=lr)
+
+    batch_losses = []   # 每個 batch 的 loss，畫出來看細節震盪
+    epoch_losses = []   # 每個 epoch 的平均 loss，畫出來看整體收斂趨勢
+    epoch_times = []    # 每個 epoch 花的時間 (秒)
+
+    train_start = time.time()
 
     for epoch in range(1, num_epochs + 1):
+        epoch_start = time.time()
         total_loss, total_correct, total_count = 0.0, 0, 0
 
         for X_batch, y_batch in iterate_minibatches(X_train, y_train, batch_size):
@@ -367,24 +545,65 @@ def main():
             logits = model.forward(X_batch)
             loss = model.compute_loss(logits, y_batch)
 
+            # Backward 
             model.backward()
 
-            sgd_step(model, lr=lr)
+            # Update (Adam)
+            optimizer.step(model.parameters_and_grads())
+
+            batch_losses.append(loss)
 
             total_loss += loss * X_batch.shape[0]
             total_correct += np.sum(np.argmax(logits, axis=1) == y_batch)
             total_count += X_batch.shape[0]
 
+        epoch_time = time.time() - epoch_start
+        epoch_times.append(epoch_time)
+
         train_loss = total_loss / total_count
         train_acc = total_correct / total_count
+        epoch_losses.append(train_loss)
 
-        # 簡單在 test set 上算一次 forward 看 accuracy (不需要 backward)
-        test_logits = model.forward(X_test)
-        test_acc = accuracy(test_logits, y_test)
+        # 每個 epoch 用 validation set 監控訓練狀況（不參與訓練，只看 forward）
+        valid_logits = model.forward(X_valid)
+        valid_acc = accuracy(valid_logits, y_valid)
 
         print(f"Epoch {epoch}/{num_epochs} | train_loss={train_loss:.4f} "
-              f"train_acc={train_acc:.4f} | test_acc={test_acc:.4f}")
+            f"train_acc={train_acc:.4f} | valid_acc={valid_acc:.4f} | "
+            f"time={epoch_time:.2f}s")
+
+    total_train_time = time.time() - train_start
+    print(f"\n總訓練時間 = {total_train_time:.2f}s "
+        f"(平均每個 epoch = {np.mean(epoch_times):.2f}s)")
+
+    # 訓練全部結束後，才用 test set 做最終、只評估一次的成績
+    test_logits = model.forward(X_test)
+    test_acc = accuracy(test_logits, y_test)
+    print(f"最終 test_acc = {test_acc:.4f}")
+
+    #1. Loss 曲線：觀察收斂情況
+    plot_loss_curve(batch_losses, epoch_losses, title_prefix="CNN")
+
+    #2. 把預測錯的圖片畫出來
+    test_preds = np.argmax(test_logits, axis=1)
+    show_misclassified(test_preds, X_test[:, 0], y_test, num_show=16,
+                        save_path="cnn_misclassified.png")
+
+    #3. Confusion Matrix 
+    plot_confusion_matrix(y_test, test_preds, num_classes=10,
+                        title="CNN Confusion Matrix",
+                        save_path="cnn_confusion_matrix.png")
+
+    return {
+        "model": model,
+        "test_acc": test_acc,
+        "batch_losses": batch_losses,
+        "epoch_losses": epoch_losses,
+        "total_train_time": total_train_time,
+        "epoch_times": epoch_times,
+    }
 
 
 if __name__ == "__main__":
     main()
+```
